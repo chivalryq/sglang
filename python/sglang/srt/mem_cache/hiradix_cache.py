@@ -478,10 +478,30 @@ class HiRadixCache(RadixCache):
         # After controller threads are fully stopped, it's safe to force-release any
         # leftover pending ops (e.g., async prefetch/backup that didn't get a revoke/ack).
         self._force_release_pending_storage_ops()
+        # The storage backend is gone, so no node's pages can be recovered from
+        # it anymore. Clear storage_backed so internal host nodes are no longer
+        # treated as host-evictable (which would orphan their subtrees).
+        self._invalidate_storage_backing()
 
         self.enable_storage = False
         self.enable_storage_metrics = False
         return True, "Detached HiCache storage backend successfully."
+
+    def _invalidate_storage_backing(self):
+        """Clear storage_backed across the tree and refresh host-leaf status.
+
+        Used when the storage backend is detached or cleared: pages that were
+        previously confirmed in storage are no longer recoverable, so internal
+        nodes must not be host-evicted (only true leaves may be).
+        """
+        stack = [self.root_node]
+        self.evictable_host_leaves.clear()
+        while stack:
+            node = stack.pop()
+            node.storage_backed = False
+            stack.extend(node.children.values())
+            if node != self.root_node:
+                self._update_host_leaf_status(node)
 
     def _force_release_pending_storage_ops(self):
         """Force release any leftover pending prefetch/backup bookkeeping.
@@ -585,15 +605,57 @@ class HiRadixCache(RadixCache):
                         cc.prefetch_tokens_occupied = 0
 
         def _drain_backup():
+            # Collect this batch first so the storage-ready reduction below uses
+            # a fixed-shape tensor across ranks. n_backup is already synchronized
+            # via all_reduce(MIN) in drain_storage_control_queues(), so every
+            # rank drains the same number of acks in the same order.
+            backup_items = []
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                ack_id = operation.id
-                entry = self.ongoing_backup.pop(ack_id, None)
-                if entry is not None:
-                    entry.release_host()
-                if log_metrics and self.enable_storage_metrics:
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+                entry = self.ongoing_backup.pop(operation.id, None)
+                backup_items.append((operation, entry))
+
+            if backup_items:
+                # storage_backed must be TP-consistent: internal host eviction
+                # decisions depend on it, and divergent decisions across ranks
+                # desync later collectives. A node's pages are storage-resident
+                # only when the rank(s) that actually back it up have completed.
+                #   - rank-replicated (MLA): only the owner rank (rank 0) writes,
+                #     so the others report completed_tokens=0; take MAX so the
+                #     owner's completion propagates to all ranks.
+                #   - sharded (MHA): every rank writes its own shard, so take MIN
+                #     -- all shards must complete before the node is recoverable.
+                is_rank_replicated_storage = (
+                    self.cache_controller.storage_config.is_mla_model
+                )
+                local_ready = [
+                    int(
+                        entry is not None
+                        and operation.completed_tokens >= len(entry.key)
                     )
+                    for operation, entry in backup_items
+                ]
+                if self.tp_world_size > 1:
+                    ready_t = torch.tensor(local_ready, dtype=torch.int)
+                    reduce_op = (
+                        torch.distributed.ReduceOp.MAX
+                        if is_rank_replicated_storage
+                        else torch.distributed.ReduceOp.MIN
+                    )
+                    self._all_reduce_attn_groups(ready_t, reduce_op)
+                    ready = ready_t.tolist()
+                else:
+                    ready = local_ready
+
+                for (operation, entry), is_ready in zip(backup_items, ready):
+                    if entry is not None:
+                        if is_ready:
+                            entry.storage_backed = True
+                        entry.release_host()
+                        self._update_host_leaf_status(entry)
+                    if log_metrics and self.enable_storage_metrics:
+                        self.storage_metrics_collector.log_backuped_tokens(
+                            operation.completed_tokens
+                        )
 
         def _drain_release():
             host_indices_list = []
@@ -740,6 +802,7 @@ class HiRadixCache(RadixCache):
                 # Check if the storage backend has a clear method (for nixl backends)
                 if hasattr(self.cache_controller.storage_backend, "clear"):
                     self.cache_controller.storage_backend.clear()
+                    self._invalidate_storage_backing()
                     logger.info(
                         "Hierarchical cache storage backend cleared successfully!"
                     )
@@ -858,6 +921,7 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        self._update_host_leaf_status(node)
 
     def _concat_split_chain(self, node: TreeNode, backup_len: int):
         """Recover enqueue-time key/hash/host by walking the split chain."""
@@ -916,10 +980,14 @@ class HiRadixCache(RadixCache):
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
-        if len(self.ongoing_write_through) == 0:
-            return
-
+        # NOTE: previously this skipped the TP all_reduce below when
+        # ongoing_write_through was empty, relying on the invariant that all
+        # ranks have the same ongoing_write_through. That invariant is not
+        # guaranteed once any code path makes per-rank write-through state
+        # diverge, and a rank that skips here while others enter desyncs the
+        # collective call sequence and hangs the next all_reduce. Always
+        # participate; when there is nothing to drain, finish_count is 0 and
+        # the loop below is a no-op.
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
@@ -1015,17 +1083,27 @@ class HiRadixCache(RadixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def _is_host_evictable(self, node: TreeNode):
+        if (
+            node == self.root_node
+            or not node.evicted
+            or not node.backuped
+            or node.lock_ref > 0
+            or node.host_ref_counter > 0
+        ):
+            return False
+        # Leaves are removed from the tree entirely. Internal nodes must keep
+        # their radix subtree reachable, so they may only shed their host pages
+        # when the pages are confirmed recoverable from the storage backend.
+        return len(node.children) == 0 or (
+            getattr(self, "enable_storage", False) and node.storage_backed
+        )
+
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if not self._is_host_evictable(node):
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
             return
-
-        for child in node.children.values():
-            if child.backuped:
-                if node in self.evictable_host_leaves:
-                    self.evictable_host_leaves.remove(node)
-                return
 
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
@@ -1115,6 +1193,8 @@ class HiRadixCache(RadixCache):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
+            if x not in self.evictable_host_leaves:
+                continue
             # only evict the host value of evicted nodes
             if not x.evicted:
                 continue
@@ -1122,21 +1202,36 @@ class HiRadixCache(RadixCache):
             if x.host_ref_counter > 0:
                 continue
 
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit remove(CPU) so the router drops the host-tier entry.
-            self._record_remove_event(x, medium=StorageMedium.CPU)
+            # Re-check eviction eligibility: heap entries can go stale as the
+            # tree mutates between heapify and pop (e.g. an internal node gained
+            # a non-evictable child, or its storage backing was invalidated).
+            if not self._is_host_evictable(x):
+                self.evictable_host_leaves.discard(x)
+                continue
+
             num_evicted += self.cache_controller.evict_host(x.host_value)
+            x.host_value = None
+            self.evictable_host_leaves.discard(x)
 
-            key = x.key.child_key(self.page_size)
-            v = x.parent.children.pop(key, None)
-            assert v == x, f"parent does not have child key, {key}"
-            if x in self.evictable_host_leaves:
-                self.evictable_host_leaves.remove(x)
-            self._update_host_leaf_status(x.parent)
+            if len(x.children) == 0:
+                # Leaf: GPU already evicted, host now freed -> the block is gone.
+                # Emit remove(CPU) so the router drops the host-tier entry and
+                # detach the node from the tree.
+                self._record_remove_event(x, medium=StorageMedium.CPU)
+                key = x.key.child_key(self.page_size)
+                v = x.parent.children.pop(key, None)
+                assert v == x, f"parent does not have child key, {key}"
+                self._update_host_leaf_status(x.parent)
 
-            if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                if len(x.parent.children) == 0 and x.parent.evicted:
+                    new_priority = self.eviction_strategy.get_priority(x.parent)
+                    heapq.heappush(eviction_heap, (new_priority, x.parent))
+            else:
+                # Internal node: only shed the host pages, keep the radix
+                # subtree reachable so it can be restored from storage later.
+                # The host pages were confirmed storage-backed by
+                # _is_host_evictable, so no remove(CPU) event is emitted.
+                self._update_host_leaf_status(x)
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1387,17 +1482,35 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
+        matched_prefix_length, matched_length, extra_matched_host_values = (
+            self._insert_helper_host(
+                last_host_node,
+                fetched_key,
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
+            )
         )
 
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.mem_pool_host.free(
+            host_indices[:matched_prefix_length]
+        )
+        if extra_matched_host_values:
+            self.cache_controller.mem_pool_host.free(
+                torch.cat(extra_matched_host_values)
+            )
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
+        # The storage read covered only min_completed_tokens of the requested
+        # prefetch_key. If it came up short, the storage backend no longer has
+        # the tail (e.g. evicted by capacity/cleaner), so any node beyond the
+        # fetched prefix that is still flagged storage_backed is stale and must
+        # not be treated as recoverable -- otherwise a still-host-resident node
+        # could be wrongly shed, or match could cross a non-recoverable gap.
+        if min_completed_tokens < len(prefetch_key):
+            self._invalidate_storage_backing_below(
+                last_host_node, prefetch_key[min_completed_tokens:]
+            )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
@@ -1444,13 +1557,29 @@ class HiRadixCache(RadixCache):
         else:
             value = self._empty_match_result.device_indices
 
+        # Collect the evicted suffix (deepest -> shallowest).
+        host_path = []
+        while last_node.evicted:
+            host_path.append(last_node)
+            last_node = last_node.parent
+
+        # Walk from the shallowest evicted node downward and stop at the first
+        # host gap. Internal host eviction can leave a parent with host_value=None
+        # while a deeper child still has host pages; those descendant pages are
+        # not a contiguous, loadable prefix, so they must not be counted as host
+        # hits.
         host_hit_length = 0
         last_host_node = last_node
-        while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
-            last_node = last_node.parent
-        while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+        for hp_node in reversed(host_path):
+            if not hp_node.backuped:
+                self.evictable_host_leaves.discard(hp_node)
+                break
+            host_hit_length += len(hp_node.host_value)
+            last_host_node = hp_node
+
+        if host_hit_length == 0:
+            while last_host_node != self.root_node and not last_host_node.backuped:
+                last_host_node = last_host_node.parent
 
         return MatchResult(
             device_indices=value,
@@ -1525,23 +1654,48 @@ class HiRadixCache(RadixCache):
     ):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, 0, []
 
         child_key = key.child_key(self.page_size)
 
+        # matched_prefix_length: leading host pages that already exist on
+        #   contiguous backed nodes -> the freshly written copy can be freed.
+        # matched_length: total tokens already host-resident (used for metrics).
+        # extra_matched_host_values: host pages that duplicate already-backed
+        #   nodes *after* a gap, so they aren't a simple leading prefix and must
+        #   be freed separately to avoid leaking host memory.
+        matched_prefix_length = 0
         matched_length = 0
+        consumed_length = 0
+        extra_matched_host_values = []
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = node.key.match(key, page_size=self.page_size)
-            key = key[prefix_len:]
-            host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
-            matched_length += prefix_len
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
+
+            if node.backuped:
+                matched_length += prefix_len
+                if consumed_length == matched_prefix_length:
+                    matched_prefix_length += prefix_len
+                else:
+                    extra_matched_host_values.append(host_value[:prefix_len])
+            else:
+                # Internal node previously shed its host pages; restore them
+                # from this freshly prefetched copy and re-mark it storage-backed.
+                node.host_value = host_value[:prefix_len].clone()
+                if node.hash_value is None:
+                    node.hash_value = hash_value[: prefix_len // self.page_size]
+                node.storage_backed = True
+                self._update_host_leaf_status(node)
+
+            consumed_length += prefix_len
+            key = key[prefix_len:]
+            host_value = host_value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
 
             if len(key):
                 child_key = key.child_key(self.page_size)
@@ -1553,6 +1707,7 @@ class HiRadixCache(RadixCache):
             new_node.value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
+            new_node.storage_backed = True
             node.children[child_key] = new_node
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
@@ -1561,7 +1716,34 @@ class HiRadixCache(RadixCache):
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
-        return matched_length
+        return matched_prefix_length, matched_length, extra_matched_host_values
+
+    def _invalidate_storage_backing_below(self, node: TreeNode, missing_key: RadixKey):
+        """Clear storage_backed along the radix path that storage failed to return.
+
+        Called when a storage prefetch came up short: the backend no longer has
+        the tail of the requested prefix (capacity/cleaner eviction). Walk the
+        radix path matched by ``missing_key`` starting at ``node`` and clear
+        storage_backed on each node it covers, refreshing host-leaf status so a
+        still-host-resident node is no longer treated as host-evictable and
+        match_prefix no longer crosses the now-unrecoverable gap.
+        """
+        key = missing_key
+        if len(key) == 0:
+            return
+        child_key = key.child_key(self.page_size)
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            if node.storage_backed:
+                node.storage_backed = False
+                self._update_host_leaf_status(node)
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            if prefix_len < len(node.key):
+                # Partial overlap: the divergence point ends the stale suffix.
+                break
+            key = key[prefix_len:]
+            if len(key):
+                child_key = key.child_key(self.page_size)
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
@@ -1607,6 +1789,9 @@ class HiRadixCache(RadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
+        # The prefix half inherits the child's storage backing: if the child's
+        # pages were confirmed in storage, the split prefix is too.
+        new_node.storage_backed = child.storage_backed
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size

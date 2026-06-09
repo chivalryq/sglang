@@ -38,7 +38,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
 )
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import TreeNode as MambaTreeNode
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
@@ -894,6 +896,319 @@ class TestRadixCache(unittest.TestCase):
 
         print(cache.available_and_evictable_str())
         print(available_and_evictable_str(cache))
+
+
+class TestHiRadixInternalHostEviction(unittest.TestCase):
+    """Internal-node host-eviction invariants, exercised without GPU pools.
+
+    These build a minimal HiRadixCache shell via object.__new__ and only
+    populate the radix-tree state the host-eviction path touches, so they run
+    on a plain CPU runner. They cover the invariant that an internal radix node
+    may shed its host pages (when storage-backed) while keeping its subtree,
+    instead of being deleted like a leaf.
+    """
+
+    def _new_hiradix_shell(self):
+        cache = object.__new__(HiRadixCache)
+        cache.disable = False
+        cache.page_size = 1
+        cache.device = torch.device("cpu")
+        cache.enable_storage = True
+        cache.tp_world_size = 1
+        cache.evictable_host_leaves = set()
+        cache._record_remove_event = lambda node, medium=None: None
+        cache._record_store_event = lambda node, medium=None: None
+
+        root = TreeNode(priority=-1)
+        root.key = RadixKey([])
+        root.value = torch.empty((0,), dtype=torch.int64)
+        root.host_value = torch.empty((0,), dtype=torch.int64)
+        root.lock_ref = 1
+        root.hash_value = []
+        cache.root_node = root
+        cache._empty_match_result = MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64, device=cache.device),
+            last_device_node=root,
+            last_host_node=root,
+            best_match_node=root,
+        )
+        return cache
+
+    def _install_host_evict_controller(self, cache):
+        class HostController:
+            def __init__(self):
+                self.evicted = []
+
+            def evict_host(self, host_value):
+                self.evicted.append(host_value.clone())
+                return len(host_value)
+
+        class EvictionStrategy:
+            def get_priority(self, node):
+                return 0
+
+        controller = HostController()
+        cache.cache_controller = controller
+        cache.eviction_strategy = EvictionStrategy()
+        return controller
+
+    def test_host_candidate_requires_leaf_or_storage_backed_internal(self):
+        """Host eviction candidates must be safe to delete or recover."""
+        cache = self._new_hiradix_shell()
+        parent = TreeNode()
+        child = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1])
+        parent.value = None
+        parent.host_value = torch.tensor([1])
+        child.parent = parent
+        child.key = RadixKey([2])
+        child.value = torch.tensor([2])
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        cache._update_host_leaf_status(parent)
+        self.assertNotIn(parent, cache.evictable_host_leaves)
+
+        parent.children.clear()
+        cache._update_host_leaf_status(parent)
+        self.assertIn(parent, cache.evictable_host_leaves)
+
+        parent.host_value = None
+        cache._update_host_leaf_status(parent)
+        self.assertNotIn(parent, cache.evictable_host_leaves)
+
+    def test_internal_storage_backed_host_value_can_be_evicted(self):
+        """Internal host eviction frees host pages without deleting the subtree."""
+        cache = self._new_hiradix_shell()
+        controller = self._install_host_evict_controller(cache)
+        removed = []
+        cache._record_remove_event = lambda node, medium=None: removed.append(node)
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1, 2, 3])
+        parent.value = None
+        parent.host_value = torch.tensor([1, 2, 3])
+        parent.storage_backed = True
+        cache.root_node.children[parent.key.child_key(cache.page_size)] = parent
+
+        child = TreeNode()
+        child.parent = parent
+        child.key = RadixKey([4])
+        child.value = None
+        child.host_value = torch.tensor([4])
+        child.storage_backed = True
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        cache._update_host_leaf_status(parent)
+        self.assertIn(parent, cache.evictable_host_leaves)
+
+        cache.evict_host(3)
+
+        self.assertIs(
+            cache.root_node.children[parent.key.child_key(cache.page_size)], parent
+        )
+        self.assertIs(parent.children[child.key.child_key(cache.page_size)], child)
+        self.assertIsNone(parent.host_value)
+        self.assertEqual(len(controller.evicted), 1)
+        self.assertEqual(removed, [])
+
+    def test_internal_host_value_eviction_requires_storage_backing(self):
+        """Internal host pages are not dropped unless L3 can recover them."""
+        cache = self._new_hiradix_shell()
+        controller = self._install_host_evict_controller(cache)
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1, 2, 3])
+        parent.value = None
+        parent.host_value = torch.tensor([1, 2, 3])
+        cache.root_node.children[parent.key.child_key(cache.page_size)] = parent
+
+        child = TreeNode()
+        child.parent = parent
+        child.key = RadixKey([4])
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        cache._update_host_leaf_status(parent)
+        self.assertNotIn(parent, cache.evictable_host_leaves)
+
+        cache.evict_host(3)
+
+        self.assertIsNotNone(parent.host_value)
+        self.assertEqual(controller.evicted, [])
+
+    def test_clear_storage_backend_invalidates_internal_storage_backing(self):
+        """Clearing L3 makes internal host pages non-recoverable from storage."""
+        cache = self._new_hiradix_shell()
+        controller = self._install_host_evict_controller(cache)
+
+        class StorageBackend:
+            def __init__(self):
+                self.cleared = False
+
+            def clear(self):
+                self.cleared = True
+
+        storage_backend = StorageBackend()
+        controller.storage_backend = storage_backend
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1, 2, 3])
+        parent.value = None
+        parent.host_value = torch.tensor([1, 2, 3])
+        parent.storage_backed = True
+        cache.root_node.children[parent.key.child_key(cache.page_size)] = parent
+
+        child = TreeNode()
+        child.parent = parent
+        child.key = RadixKey([4])
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        cache._update_host_leaf_status(parent)
+        self.assertIn(parent, cache.evictable_host_leaves)
+
+        self.assertTrue(cache.clear_storage_backend())
+
+        self.assertTrue(storage_backend.cleared)
+        self.assertFalse(parent.storage_backed)
+        self.assertNotIn(parent, cache.evictable_host_leaves)
+
+        cache.evict_host(3)
+        self.assertIsNotNone(parent.host_value)
+        self.assertEqual(controller.evicted, [])
+
+    def test_match_prefix_does_not_skip_host_gap(self):
+        """Child host hits are unusable when an ancestor host value is gone."""
+        cache = self._new_hiradix_shell()
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1, 2])
+        parent.value = None
+        parent.host_value = None
+        parent.storage_backed = True
+        cache.root_node.children[parent.key.child_key(cache.page_size)] = parent
+
+        child = TreeNode()
+        child.parent = parent
+        child.key = RadixKey([3, 4])
+        child.value = None
+        child.host_value = torch.tensor([3, 4])
+        child.storage_backed = True
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3, 4])))
+
+        self.assertEqual(result.host_hit_length, 0)
+        self.assertIs(result.last_host_node, cache.root_node)
+
+    def test_insert_helper_host_restores_existing_storage_node(self):
+        """L3 reads must refill existing storage-only radix nodes."""
+        cache = self._new_hiradix_shell()
+
+        node = TreeNode()
+        node.parent = cache.root_node
+        node.key = RadixKey([1, 2])
+        node.value = None
+        node.host_value = None
+        node.hash_value = ["h1", "h2"]
+        node.storage_backed = True
+        cache.root_node.children[node.key.child_key(cache.page_size)] = node
+
+        matched_prefix, matched, extra = cache._insert_helper_host(
+            cache.root_node, RadixKey([1, 2]), torch.tensor([10, 11]), ["h1", "h2"]
+        )
+        self.assertEqual(matched_prefix, 0)
+        self.assertEqual(matched, 0)
+        self.assertEqual(extra, [])
+        self.assertTrue(torch.equal(node.host_value, torch.tensor([10, 11])))
+
+        matched_prefix, matched, extra = cache._insert_helper_host(
+            cache.root_node, RadixKey([1, 2]), torch.tensor([12, 13]), ["h1", "h2"]
+        )
+        self.assertEqual(matched_prefix, 2)
+        self.assertEqual(matched, 2)
+        self.assertEqual(extra, [])
+        self.assertTrue(torch.equal(node.host_value, torch.tensor([10, 11])))
+
+    def test_insert_helper_host_reports_non_prefix_duplicate_host_pages(self):
+        """Duplicate host pages after a storage gap must be released separately."""
+        cache = self._new_hiradix_shell()
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.key = RadixKey([1, 2])
+        parent.value = None
+        parent.host_value = None
+        parent.hash_value = ["h1", "h2"]
+        parent.storage_backed = True
+        cache.root_node.children[parent.key.child_key(cache.page_size)] = parent
+
+        child = TreeNode()
+        child.parent = parent
+        child.key = RadixKey([3, 4])
+        child.value = None
+        child.host_value = torch.tensor([30, 31])
+        child.hash_value = ["h3", "h4"]
+        child.storage_backed = True
+        parent.children[child.key.child_key(cache.page_size)] = child
+
+        matched_prefix, matched, extra = cache._insert_helper_host(
+            cache.root_node,
+            RadixKey([1, 2, 3, 4]),
+            torch.tensor([10, 11, 20, 21]),
+            ["h1", "h2", "h3", "h4"],
+        )
+        self.assertEqual(matched_prefix, 0)
+        self.assertEqual(matched, 2)
+        self.assertEqual(len(extra), 1)
+        self.assertTrue(torch.equal(extra[0], torch.tensor([20, 21])))
+        self.assertTrue(torch.equal(parent.host_value, torch.tensor([10, 11])))
+        self.assertTrue(torch.equal(child.host_value, torch.tensor([30, 31])))
+
+    def test_invalidate_storage_backing_below_clears_stale_nodes(self):
+        """A short storage read clears storage_backed on the unrecoverable tail."""
+        cache = self._new_hiradix_shell()
+
+        # root -> a (storage-backed) -> b (storage-backed, internal: has a child)
+        # Simulate the backend having dropped b's object: a prefetch for
+        # [1,2,3,4] only returned [1,2], so the tail [3,4] is gone.
+        a = TreeNode()
+        a.parent = cache.root_node
+        a.key = RadixKey([1, 2])
+        a.value = None
+        a.host_value = torch.tensor([1, 2])
+        a.storage_backed = True
+        cache.root_node.children[a.key.child_key(cache.page_size)] = a
+
+        b = TreeNode()
+        b.parent = a
+        b.key = RadixKey([3, 4])
+        b.value = None
+        b.host_value = torch.tensor([3, 4])
+        b.storage_backed = True
+        a.children[b.key.child_key(cache.page_size)] = b
+
+        # b is internal (has a child), so before invalidation it is host-evictable
+        # only because storage_backed=True.
+        leaf = TreeNode()
+        leaf.parent = b
+        leaf.key = RadixKey([5])
+        leaf.value = torch.tensor([5])
+        b.children[leaf.key.child_key(cache.page_size)] = leaf
+        cache._update_host_leaf_status(b)
+        self.assertIn(b, cache.evictable_host_leaves)
+
+        # Storage returned only the first page; [3,4] is the missing tail.
+        cache._invalidate_storage_backing_below(a, RadixKey([3, 4]))
+
+        # b is no longer storage-backed, so the internal node is no longer
+        # host-evictable; a (still covered) is untouched.
+        self.assertFalse(b.storage_backed)
+        self.assertTrue(a.storage_backed)
+        self.assertNotIn(b, cache.evictable_host_leaves)
 
 
 if __name__ == "__main__":
